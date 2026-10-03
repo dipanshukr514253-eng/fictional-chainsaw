@@ -78,7 +78,7 @@ def _load_rembg() -> bool:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8570765868:AAFFcOCsB92iVyZB6akGxwN1yNPuiVFIy54").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-OWNER_ID = os.getenv("OWNER_ID", "").strip()
+OWNER_ID = os.getenv("OWNER_ID", "8559547390").strip()
 def _read_port() -> int:
     raw = os.getenv("PORT", "8080").strip()
     try:
