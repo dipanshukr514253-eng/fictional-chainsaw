@@ -17,6 +17,8 @@ Optional environment variables:
 
 import asyncio
 import binascii
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -28,10 +30,11 @@ import tempfile
 import time
 import uuid
 import zipfile
+from urllib.parse import parse_qsl
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -58,16 +61,26 @@ _REMBG_CHECKED = False
 REMBG_AVAILABLE = False
 
 
+_rembg_session = None
+
+
 def _load_rembg() -> bool:
-    global _rembg_remove, _REMBG_CHECKED, REMBG_AVAILABLE
+    global _rembg_remove, _REMBG_CHECKED, REMBG_AVAILABLE, _rembg_session
     if _REMBG_CHECKED:
         return REMBG_AVAILABLE
     _REMBG_CHECKED = True
     try:
-        from rembg import remove
+        from rembg import remove, new_session
         _rembg_remove = remove
+        try:
+            # u2netp = small model (~4 MB), safe for 512 MB Render instances
+            _rembg_session = new_session("u2netp")
+        except Exception:
+            _rembg_session = None
         REMBG_AVAILABLE = True
     except Exception:
+        logging.getLogger("passport-bot").warning(
+            "rembg not available - using fallback", exc_info=True)
         _rembg_remove = None
         REMBG_AVAILABLE = False
     return REMBG_AVAILABLE
@@ -76,9 +89,9 @@ def _load_rembg() -> bool:
 # Configuration
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8570765868:AAFFcOCsB92iVyZB6akGxwN1yNPuiVFIy54").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-OWNER_ID = os.getenv("OWNER_ID", "8559547390").strip()
+OWNER_ID = os.getenv("OWNER_ID", "").strip()
 def _read_port() -> int:
     raw = os.getenv("PORT", "8080").strip()
     try:
@@ -92,9 +105,16 @@ def _read_port() -> int:
 PORT = _read_port()
 
 DPI = 300                      # print quality
-MARGIN_MM = 10.0               # page margin on every side
-SPACING_MM = 5.0               # gap between photos
-BORDER_RGB = (45, 45, 45)      # thin clean border around each photo
+MARGIN_MM = 10.0               # page margin (top / left / right / bottom)
+SPACING_MM = 1.5               # small gap between photos (tight row layout)
+BORDER_RGB = (0, 0, 0)         # black border around each photo
+BORDER_MM = 0.5                # border thickness (drawn INSIDE photo size)
+RMBG_MAX_SIDE = 1400           # downscale before rembg -> avoids Render OOM
+# rembg (AI cut-out) is OPT-IN: set env USE_REMBG=1 only on instances with
+# >= 1 GB RAM. By default a fast, memory-safe built-in method is used, so the
+# bot can never hang or crash while changing the background.
+USE_REMBG = os.getenv("USE_REMBG", "0").strip() in ("1", "true", "yes")
+GENERATION_TIMEOUT = 150       # seconds before the bot gives up and reports
 JPEG_QUALITY = 95
 
 MAX_QTY = 500
@@ -120,7 +140,7 @@ PHOTO_SIZES = {
 }
 
 BG_PRESETS = {
-    "blue": ("🔵 Blue", (67, 142, 219)),
+    "blue": ("🔵 Blue", (105, 109, 243)),
     "red": ("🔴 Red", (211, 47, 47)),
     "white": ("⚪ White", (255, 255, 255)),
     "green": ("🟢 Green", (46, 125, 50)),
@@ -141,6 +161,26 @@ _generation_semaphore = asyncio.Semaphore(GENERATION_CONCURRENCY)
 _started_at = time.time()
 _generation_count = 0
 log = logging.getLogger("passport-bot")
+_bot = None  # set in main(); used by the Mini App to deliver files in chat
+
+
+def verify_init_data(init_data: str):
+    """Validate Telegram WebApp initData (HMAC). Returns user id or None."""
+    try:
+        if not init_data or not BOT_TOKEN:
+            return None
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        their_hash = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        mine = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mine, their_hash):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > 86400:
+            return None
+        return int(json.loads(pairs["user"])["id"])
+    except Exception:
+        return None
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -228,49 +268,118 @@ def load_image(data: bytes) -> Image.Image:
     return img
 
 
-def _fallback_bg_remove(img: Image.Image, rgb) -> Image.Image:
-    """Safe fallback when advanced background removal is unavailable/fails:
-    distance-to-border-color segmentation with a feathered mask."""
-    arr = np.asarray(img).astype(np.int16)
+def _bg_mask_from_border(small: Image.Image):
+    """Return (dist, bg_mask) for a small RGB image.
+    bg_mask = pixels similar to the border colour AND connected to the border
+    (so a similar colour inside the person is NOT removed)."""
+    arr = np.asarray(small).astype(np.float32)
     h, w, _ = arr.shape
-    b = max(4, min(h, w) // 40)
+    b = max(3, min(h, w) // 50)
     border = np.concatenate([
         arr[:b, :, :].reshape(-1, 3),
-        arr[-b:, :, :].reshape(-1, 3),
         arr[:, :b, :].reshape(-1, 3),
         arr[:, -b:, :].reshape(-1, 3),
-    ])
-    bg = np.median(border, axis=0)
-    dist = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-    fg = (dist > 45).astype(np.uint8) * 255
-    mask = Image.fromarray(fg, "L").filter(ImageFilter.GaussianBlur(2))
-    bg_img = Image.new("RGB", img.size, rgb)
-    return Image.composite(img, bg_img, mask)
+    ])  # top + left + right edges (bottom usually holds the shoulders)
+    ref = np.median(border, axis=0)
+    spread = np.sqrt(((border - ref) ** 2).sum(axis=1))
+    tol = float(np.clip(np.percentile(spread, 90) * 1.6 + 18, 30, 80))
+    dist = np.sqrt(((arr - ref) ** 2).sum(axis=2))
+    cand = dist < tol
 
+    seed = np.zeros_like(cand)
+    seed[:b, :] = True
+    seed[:, :b] = True
+    seed[:, -b:] = True
+    seed &= cand
 
-def replace_background(img: Image.Image, rgb) -> Image.Image:
-    """Intelligently remove the existing background and apply rgb.
-    Uses rembg when available; falls back gracefully, never crashes."""
-    if _load_rembg():
-        try:
-            out = _rembg_remove(img)  # RGBA with alpha matte
-            if isinstance(out, bytes):
-                out = Image.open(io.BytesIO(out)).convert("RGBA")
-            else:
-                out = out.convert("RGBA")
-            if out.size != img.size:
-                out = out.resize(img.size, Image.LANCZOS)
-            alpha = out.getchannel("A").filter(ImageFilter.GaussianBlur(0.6))
-            bg_img = Image.new("RGB", img.size, rgb)
-            fg = out.convert("RGB")
-            return Image.composite(fg, bg_img, alpha)
-        except Exception:
-            log.warning("rembg background removal failed; using fallback", exc_info=True)
     try:
-        return _fallback_bg_remove(img, rgb)
+        from scipy import ndimage
+        lab, _n = ndimage.label(cand)
+        keep = np.unique(lab[seed])
+        keep = keep[keep != 0]
+        bg = np.isin(lab, keep)
     except Exception:
-        log.warning("fallback background removal failed; keeping original", exc_info=True)
-        return img
+        # scipy-free flood fill by repeated dilation inside the candidate mask
+        cur = Image.fromarray((seed * 255).astype(np.uint8), "L")
+        cmask = Image.fromarray((cand * 255).astype(np.uint8), "L")
+        prev = -1
+        for _ in range(400):
+            cur = ImageChops.multiply(cur.filter(ImageFilter.MaxFilter(9)), cmask)
+            tot = int(np.asarray(cur).sum())
+            if tot == prev:
+                break
+            prev = tot
+        bg = np.asarray(cur) > 127
+    return dist, tol, bg
+
+
+def _builtin_bg_replace(img: Image.Image, rgb):
+    """Memory-safe background replacement (no AI model). Returns (img, ok)."""
+    k = min(1.0, 1100 / max(img.size))
+    small = img if k >= 1 else img.resize(
+        (max(1, int(img.width * k)), max(1, int(img.height * k))), Image.BILINEAR)
+    dist, tol, bg = _bg_mask_from_border(small)
+    frac = float(bg.mean())
+    if frac < 0.06 or frac > 0.85:
+        return img, False  # background not plain enough -> do not damage photo
+    # Safety: the lower part of a passport photo is the person's clothes.
+    # If most of it was classified as "background" (e.g. white shirt on white
+    # wall), the cut-out is unreliable -> keep the original instead of
+    # painting the clothes with the new colour.
+    if float(bg[int(bg.shape[0] * 0.8):, :].mean()) > 0.45:
+        return img, False
+
+    bgimg = Image.fromarray((bg * 255).astype(np.uint8), "L")
+    # soft edge band: pixels just outside the bg region that still look
+    # partly like the old background get partial transparency (kills halos)
+    band = bgimg.filter(ImageFilter.MaxFilter(7))
+    band_np = (np.asarray(band) > 127) & (~bg)
+    fg = np.ones_like(dist, dtype=np.float32)
+    fg[bg] = 0.0
+    soft = np.clip((dist - tol) / (tol * 1.2), 0.0, 1.0)
+    fg[band_np] = soft[band_np]
+    alpha = Image.fromarray((fg * 255).astype(np.uint8), "L")
+    alpha = alpha.filter(ImageFilter.GaussianBlur(1.2))
+    if alpha.size != img.size:
+        alpha = alpha.resize(img.size, Image.BICUBIC)
+    new_bg = Image.new("RGB", img.size, rgb)
+    return Image.composite(img, new_bg, alpha), True
+
+
+def _rembg_replace(img: Image.Image, rgb):
+    small = img
+    if max(img.size) > RMBG_MAX_SIDE:
+        k = RMBG_MAX_SIDE / max(img.size)
+        small = img.resize((max(1, int(img.width * k)),
+                            max(1, int(img.height * k))), Image.LANCZOS)
+    kw = {"session": _rembg_session} if _rembg_session else {}
+    out = _rembg_remove(small, **kw)
+    if isinstance(out, bytes):
+        out = Image.open(io.BytesIO(out))
+    alpha = out.convert("RGBA").getchannel("A")
+    if alpha.size != img.size:
+        alpha = alpha.resize(img.size, Image.LANCZOS)
+    alpha = alpha.filter(ImageFilter.GaussianBlur(0.8))
+    return Image.composite(img, Image.new("RGB", img.size, rgb), alpha)
+
+
+def replace_background(img: Image.Image, rgb):
+    """Replace the photo background with rgb. Never raises.
+    Returns (image, note) where note is a warning string or None."""
+    if USE_REMBG and _load_rembg():
+        try:
+            return _rembg_replace(img, rgb), None
+        except Exception:
+            log.warning("rembg failed; using built-in method", exc_info=True)
+    try:
+        out, ok = _builtin_bg_replace(img, rgb)
+        if ok:
+            return out, None
+        return img, ("⚠️ Background could not be detected automatically "
+                     "(it is not a plain colour). Original background kept.")
+    except Exception:
+        log.warning("built-in background replace failed", exc_info=True)
+        return img, "⚠️ Background change failed. Original background kept."
 
 
 def crop_to_ratio(img: Image.Image, ratio: float) -> Image.Image:
@@ -291,14 +400,16 @@ def crop_to_ratio(img: Image.Image, ratio: float) -> Image.Image:
     return img.crop((0, y0, w, y0 + new_h))
 
 
-def build_passport_photo(img: Image.Image, bg_rgb, pw_mm, ph_mm) -> Image.Image:
+def build_passport_photo(img: Image.Image, bg_rgb, pw_mm, ph_mm):
+    """Returns (photo, note)."""
+    note = None
     if bg_rgb is not None:
-        img = replace_background(img, bg_rgb)
+        img, note = replace_background(img, bg_rgb)
     img = crop_to_ratio(img, pw_mm / ph_mm)
     target = (mm_to_px(pw_mm), mm_to_px(ph_mm))
     if img.size != target:
         img = img.resize(target, Image.LANCZOS)
-    return img
+    return img, note
 
 
 def build_sheet(photo: Image.Image, page_w_mm, page_h_mm,
@@ -314,25 +425,19 @@ def build_sheet(photo: Image.Image, page_w_mm, page_h_mm,
     W, H = mm_to_px(page_w_mm), mm_to_px(page_h_mm)
     pw, ph = photo.size
     sp = mm_to_px(SPACING_MM)
-    border = max(1, DPI // 150)
+    margin = mm_to_px(MARGIN_MM)
+    border = max(2, mm_to_px(BORDER_MM))
 
+    # Page is exactly the selected size; photos start at the TOP-LEFT.
     sheet = Image.new("RGB", (W, H), (255, 255, 255))
     draw = ImageDraw.Draw(sheet)
 
-    rows_used = math.ceil(count / cols)
-    grid_h = rows_used * ph + (rows_used - 1) * sp
-    top = (H - grid_h) // 2
-
     for i in range(count):
         row, col = divmod(i, cols)
-        items_in_row = min(cols, count - row * cols)
-        row_w = items_in_row * pw + (items_in_row - 1) * sp
-        left = (W - row_w) // 2
-        x = left + col * (pw + sp)
-        y = top + row * (ph + sp)
+        x = margin + col * (pw + sp)
+        y = margin + row * (ph + sp)
         sheet.paste(photo, (x, y))
-        draw.rectangle([x - border, y - border,
-                        x + pw - 1 + border, y + ph - 1 + border],
+        draw.rectangle([x, y, x + pw - 1, y + ph - 1],
                        outline=BORDER_RGB, width=border)
     return sheet
 
@@ -353,7 +458,7 @@ def generate_files(image_bytes: bytes, page_w_mm: float, page_h_mm: float,
     capacity = cols * rows
     pages = math.ceil(qty / capacity)
 
-    passport = build_passport_photo(img, bg_rgb, pw_mm, ph_mm)
+    passport, note = build_passport_photo(img, bg_rgb, pw_mm, ph_mm)
 
     sheets = []
     remaining = qty
@@ -394,7 +499,7 @@ def generate_files(image_bytes: bytes, page_w_mm: float, page_h_mm: float,
     if fmt in ("png", "pdf_png"):
         for i, s in enumerate(sheets, 1):
             to_png(s, f"{base}_p{i}.png")
-    return files, pages
+    return files, pages, note
 
 # --------------------------------------------------------------------------- #
 # FSM states
@@ -1026,24 +1131,38 @@ async def cb_generate(cq: CallbackQuery, state: FSMContext):
                         "moment, especially with background removal.")
     await cq.answer()
 
+    note = None
     try:
         image_bytes = path.read_bytes()
         loop = asyncio.get_running_loop()
-        files, pages = await loop.run_in_executor(
-            None, generate_files, image_bytes, page_w, page_h,
-            bg_rgb, ps_w, ps_h, qty, fmt)
-    except ValueError as exc:
-        await cq.message.answer(f"⚠️ {exc}")
+        files, pages, note = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, generate_files, image_bytes, page_w, page_h,
+                bg_rgb, ps_w, ps_h, qty, fmt),
+            timeout=GENERATION_TIMEOUT)
+    except asyncio.TimeoutError:
+        log.error("generation timed out")
+        await cq.message.answer(
+            "⚠️ Processing took too long. Please try again, or choose "
+            "<b>Skip</b> for the background.", reply_markup=kb_summary())
         return
-    except Exception:
+    except ValueError as exc:
+        await cq.message.answer(f"⚠️ {exc}", reply_markup=kb_summary())
+        return
+    except BaseException as exc:  # never leave the user without an answer
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         log.exception("generation failed")
         await cq.message.answer("⚠️ Sorry, something went wrong while "
-                                "generating your files. Please try again.")
+                                "generating your files. Please try again.",
+                                reply_markup=kb_summary())
         return
 
     try:
         caption = (f"🖨 Done! {qty} photo(s), {pages} page(s), "
                    f"{ps_w:g} × {ps_h:g} mm @ {DPI} DPI.")
+        if note:
+            await cq.message.answer(note)
         for fname, blob in files:
             await cq.message.answer_document(
                 BufferedInputFile(blob, filename=fname), caption=caption)
@@ -1364,6 +1483,7 @@ async function generate(){
   try{
     const fd=new FormData();
     fd.append("photo",P.file);
+    fd.append("initData",(tg&&tg.initData)?tg.initData:"");
     fd.append("payload",JSON.stringify({
       page:P.page, page_w:P.pw, page_h:P.ph,
       bg:P.bg, hex:P.hex, ps:P.ps, ps_w:P.psw, ps_h:P.psh,
@@ -1373,6 +1493,14 @@ async function generate(){
       let msg="Generation failed. Try different settings.";
       try{ msg=(await r.json()).error||msg; }catch(e){}
       throw new Error(msg);
+    }
+    const ct=r.headers.get("Content-Type")||"";
+    if(ct.indexOf("application/json")===0){
+      const j=await r.json();
+      spin.style.display="none";
+      document.getElementById("summary").innerHTML="🎉 <b>Done!</b> Your file was sent to your Telegram chat with the bot.";
+      if(tg){ tg.showPopup({title:"Done",message:"Your file was sent to the bot chat."}, function(){ tg.close(); }); }
+      return;
     }
     const blob=await r.blob();
     const cd=r.headers.get("Content-Disposition")||"";
@@ -1419,7 +1547,7 @@ async def http_info(request: web.Request) -> web.Response:
         "version": "2.1",
         "uptime_seconds": round(time.time() - _started_at, 1),
         "telegram_configured": bool(BOT_TOKEN),
-        "rembg_available": REMBG_AVAILABLE,
+        "rembg_enabled": USE_REMBG,
         "generation_concurrency": GENERATION_CONCURRENCY,
         "generations_completed": _generation_count,
     })
@@ -1435,8 +1563,11 @@ async def http_generate(request: web.Request) -> web.Response:
         reader = await request.multipart()
         photo_bytes = None
         payload = None
+        init_data = ""
         async for part in reader:
-            if part.name == "photo":
+            if part.name == "initData":
+                init_data = (await part.read(decode=False)).decode("utf-8", "ignore")
+            elif part.name == "photo":
                 photo_bytes = await part.read(decode=False)
             elif part.name == "payload":
                 try:
@@ -1513,20 +1644,54 @@ async def http_generate(request: web.Request) -> web.Response:
         loop = asyncio.get_running_loop()
         try:
             async with _generation_semaphore:
-                files, pages = await loop.run_in_executor(
-                    None, generate_files, image_bytes, page_w, page_h,
-                    bg_rgb, ps_w, ps_h, qty, fmt)
+                files, pages, note = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, generate_files, image_bytes, page_w, page_h,
+                        bg_rgb, ps_w, ps_h, qty, fmt),
+                    timeout=GENERATION_TIMEOUT)
             global _generation_count
             _generation_count += 1
+        except asyncio.TimeoutError:
+            return web.json_response(
+                {"error": "Processing took too long. Try again or skip the background."},
+                status=504)
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
+
+        # Preferred: deliver straight into the user's Telegram chat
+        # (blob downloads do not work inside Telegram's in-app browser).
+        uid = verify_init_data(init_data)
+        if uid and _bot is not None:
+            try:
+                caption = (f"🖨 Done! {qty} photo(s), {pages} page(s), "
+                           f"{ps_w:g} × {ps_h:g} mm @ {DPI} DPI.")
+                if note:
+                    await _bot.send_message(uid, note)
+                for fname, blob in files:
+                    await _bot.send_document(
+                        uid, BufferedInputFile(blob, filename=fname),
+                        caption=caption)
+                return web.json_response({"sent": True, "files": len(files)})
+            except Exception:
+                log.warning("mini app: sending to chat failed; falling back",
+                            exc_info=True)
+
+        def _ctype(name):
+            n = name.lower()
+            if n.endswith(".pdf"):
+                return "application/pdf"
+            if n.endswith(".jpg") or n.endswith(".jpeg"):
+                return "image/jpeg"
+            if n.endswith(".png"):
+                return "image/png"
+            return "application/octet-stream"
 
         if len(files) == 1:
             fname, blob = files[0]
             return web.Response(
                 body=blob,
                 headers={"Content-Disposition": f'attachment; filename="{fname}"',
-                         "Content-Type": "application/octet-stream"})
+                         "Content-Type": _ctype(fname)})
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1578,11 +1743,14 @@ async def main() -> None:
 
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global _bot
+    _bot = bot
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        log.info("Bot started (rembg available: %s)", REMBG_AVAILABLE)
+        await asyncio.sleep(5)  # let any old Render instance shut down first
+        log.info("Bot started (rembg enabled: %s)", USE_REMBG)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await runner.cleanup()
