@@ -1,0 +1,6 @@
+aiogram>=3.7,<4.0
+aiohttp>=3.9,<4.0
+Pillow>=10.3,<12.0
+numpy>=1.26,<3.0
+rembg>=2.0.56
+onnxruntime>=1.17,<2.0
