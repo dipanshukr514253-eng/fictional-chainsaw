@@ -76,7 +76,7 @@ def _load_rembg() -> bool:
 # Configuration
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8570765868:AAFFcOCsB92iVyZB6akGxwN1yNPuiVFIy54").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
 OWNER_ID = os.getenv("OWNER_ID", "").strip()
 def _read_port() -> int:
