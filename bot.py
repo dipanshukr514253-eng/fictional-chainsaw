@@ -18,6 +18,7 @@ Optional environment variables:
 import asyncio
 import binascii
 import io
+import json
 import logging
 import math
 import os
@@ -50,22 +51,45 @@ from aiogram.types import (
     WebAppInfo,
 )
 
-# Optional advanced background removal (works on Railway; falls back safely).
-try:
-    from rembg import remove as _rembg_remove
-    REMBG_AVAILABLE = True
-except Exception:  # pragma: no cover - environment dependent
-    _rembg_remove = None
-    REMBG_AVAILABLE = False
+# Optional advanced background removal. It is loaded lazily so Render can bind
+# its HTTP port immediately instead of waiting for the ONNX model at boot.
+_rembg_remove = None
+_REMBG_CHECKED = False
+REMBG_AVAILABLE = False
+
+
+def _load_rembg() -> bool:
+    global _rembg_remove, _REMBG_CHECKED, REMBG_AVAILABLE
+    if _REMBG_CHECKED:
+        return REMBG_AVAILABLE
+    _REMBG_CHECKED = True
+    try:
+        from rembg import remove
+        _rembg_remove = remove
+        REMBG_AVAILABLE = True
+    except Exception:
+        _rembg_remove = None
+        REMBG_AVAILABLE = False
+    return REMBG_AVAILABLE
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8570765868:AAFFcOCsB92iVyZB6akGxwN1yNPuiVFIy54").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
-OWNER_ID = os.getenv("OWNER_ID", "8559547390").strip()
-PORT = int(os.getenv("PORT", "8080") or "8080")
+OWNER_ID = os.getenv("OWNER_ID", "").strip()
+def _read_port() -> int:
+    raw = os.getenv("PORT", "8080").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        logging.getLogger("passport-bot").warning("Invalid PORT=%r; using 8080", raw)
+        return 8080
+    return port if 1 <= port <= 65535 else 8080
+
+
+PORT = _read_port()
 
 DPI = 300                      # print quality
 MARGIN_MM = 10.0               # page margin on every side
@@ -108,6 +132,14 @@ IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff
 TMP_ROOT = Path(tempfile.gettempdir()) / "passport_photo_bot"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
+# Protect the public Mini App endpoint from accidental overload on small Render instances.
+try:
+    GENERATION_CONCURRENCY = max(1, int(os.getenv("GENERATION_CONCURRENCY", "1") or "1"))
+except ValueError:
+    GENERATION_CONCURRENCY = 1
+_generation_semaphore = asyncio.Semaphore(GENERATION_CONCURRENCY)
+_started_at = time.time()
+_generation_count = 0
 log = logging.getLogger("passport-bot")
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +251,7 @@ def _fallback_bg_remove(img: Image.Image, rgb) -> Image.Image:
 def replace_background(img: Image.Image, rgb) -> Image.Image:
     """Intelligently remove the existing background and apply rgb.
     Uses rembg when available; falls back gracefully, never crashes."""
-    if REMBG_AVAILABLE:
+    if _load_rembg():
         try:
             out = _rembg_remove(img)  # RGBA with alpha matte
             if isinstance(out, bytes):
@@ -1376,8 +1408,25 @@ async def http_index(request: web.Request) -> web.Response:
     return web.Response(text=MINIAPP_HTML, content_type="text/html")
 
 
+async def http_favicon(request: web.Request) -> web.Response:
+    return web.Response(status=204)
+
+
+async def http_info(request: web.Request) -> web.Response:
+    """Small public diagnostics endpoint useful for Render and uptime monitors."""
+    return web.json_response({
+        "service": "passport-photo-maker",
+        "version": "2.1",
+        "uptime_seconds": round(time.time() - _started_at, 1),
+        "telegram_configured": bool(BOT_TOKEN),
+        "rembg_available": REMBG_AVAILABLE,
+        "generation_concurrency": GENERATION_CONCURRENCY,
+        "generations_completed": _generation_count,
+    })
+
+
 async def http_health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "service": "passport-photo-maker"})
 
 
 async def http_generate(request: web.Request) -> web.Response:
@@ -1390,7 +1439,6 @@ async def http_generate(request: web.Request) -> web.Response:
             if part.name == "photo":
                 photo_bytes = await part.read(decode=False)
             elif part.name == "payload":
-                import json
                 try:
                     payload = json.loads((await part.read(decode=False)).decode("utf-8"))
                 except Exception:
@@ -1464,9 +1512,12 @@ async def http_generate(request: web.Request) -> web.Response:
 
         loop = asyncio.get_running_loop()
         try:
-            files, pages = await loop.run_in_executor(
-                None, generate_files, image_bytes, page_w, page_h,
-                bg_rgb, ps_w, ps_h, qty, fmt)
+            async with _generation_semaphore:
+                files, pages = await loop.run_in_executor(
+                    None, generate_files, image_bytes, page_w, page_h,
+                    bg_rgb, ps_w, ps_h, qty, fmt)
+            global _generation_count
+            _generation_count += 1
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
@@ -1497,6 +1548,9 @@ async def start_web_server() -> web.AppRunner:
     app = web.Application(client_max_size=MAX_IMAGE_BYTES + 2 * 1024 * 1024)
     app.router.add_get("/", http_index)
     app.router.add_get("/health", http_health)
+    app.router.add_get("/healthz", http_health)
+    app.router.add_get("/api/info", http_info)
+    app.router.add_get("/favicon.ico", http_favicon)
     app.router.add_post("/api/generate", http_generate)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1511,15 +1565,21 @@ async def start_web_server() -> web.AppRunner:
 # --------------------------------------------------------------------------- #
 
 async def main() -> None:
+    # Start the HTTP listener first. Render detects readiness by scanning the port;
+    # Telegram setup must never prevent /health from becoming available.
+    runner = await start_web_server()
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN environment variable is not set.")
+        log.error("BOT_TOKEN is not set; running in web-only mode. Set BOT_TOKEN to enable Telegram polling.")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+        return
 
     bot = Bot(token=BOT_TOKEN,
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-
-    runner = await start_web_server()
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Bot started (rembg available: %s)", REMBG_AVAILABLE)
